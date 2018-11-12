@@ -1,51 +1,61 @@
 package io.github.hpquintana.demochat.activities
 
+import android.Manifest.permission.READ_CONTACTS
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.annotation.TargetApi
-import android.content.pm.PackageManager
-import android.support.design.widget.Snackbar
-import android.support.v7.app.AppCompatActivity
 import android.app.LoaderManager.LoaderCallbacks
 import android.content.CursorLoader
+import android.content.Intent
 import android.content.Loader
+import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
-import android.os.AsyncTask
 import android.os.Build
 import android.os.Bundle
 import android.provider.ContactsContract
+import android.support.design.widget.Snackbar
+import android.support.v7.app.AppCompatActivity
 import android.text.TextUtils
+import android.util.Log
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.ArrayAdapter
 import android.widget.TextView
-
-import java.util.ArrayList
-import android.Manifest.permission.READ_CONTACTS
-import android.content.Intent
+import android.widget.Toast
+import com.google.android.gms.tasks.OnSuccessListener
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.DatabaseReference
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.iid.FirebaseInstanceId
+import com.google.firebase.iid.InstanceIdResult
+import com.sendbird.android.SendBird
 import io.github.hpquintana.demochat.R
-
+import io.github.hpquintana.demochat.sendbird.main.ConnectionManager
 import kotlinx.android.synthetic.main.activity_login.*
+import java.util.*
 
 class LoginActivity : AppCompatActivity(), LoaderCallbacks<Cursor> {
-    private var mAuthTask: UserLoginTask? = null
     private lateinit var registerTextView: TextView
+    private val fbAuth = FirebaseAuth.getInstance()
+    private var isLoggingIn = false
+    private val TAG = LoginActivity::class.java.simpleName
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_login)
         // Set up the login form.
-        populateAutoComplete()
+//        populateAutoComplete()
         password.setOnEditorActionListener(TextView.OnEditorActionListener { _, id, _ ->
             if (id == EditorInfo.IME_ACTION_DONE || id == EditorInfo.IME_NULL) {
-                attemptLogin()
+                checkLoginstatus()
                 return@OnEditorActionListener true
             }
             false
         })
 
-        email_sign_in_button.setOnClickListener { attemptLogin() }
+        email_sign_in_button.setOnClickListener { checkLoginstatus() }
         registerTextView = findViewById<TextView>(R.id.register_textview)
         registerTextView.setOnClickListener { goToRegisterActivity() }
     }
@@ -102,16 +112,17 @@ class LoginActivity : AppCompatActivity(), LoaderCallbacks<Cursor> {
         }
     }
 
-
+    private fun checkLoginstatus() {
+        if (!isLoggingIn) {
+            attemptLogin()
+        }
+    }
     /**
      * Attempts to sign in or register the account specified by the login form.
      * If there are form errors (invalid email, missing fields, etc.), the
      * errors are presented and no actual login attempt is made.
      */
     private fun attemptLogin() {
-        if (mAuthTask != null) {
-            return
-        }
 
         // Reset errors.
         email.error = null
@@ -150,8 +161,17 @@ class LoginActivity : AppCompatActivity(), LoaderCallbacks<Cursor> {
             // Show a progress spinner, and kick off a background task to
             // perform the user login attempt.
             showProgress(true)
-            mAuthTask = UserLoginTask(emailStr, passwordStr)
-            mAuthTask!!.execute(null as Void?)
+            fbAuth.signInWithEmailAndPassword(emailStr, passwordStr).addOnCompleteListener(this) { task ->
+                if (task.isSuccessful) {
+                    //set up token for push notifications
+                    refreshToken()
+                } else {
+                    Log.e("LOGIN", "login error?!")
+                    Toast.makeText(this, "Error Logging in :(", Toast.LENGTH_LONG).show()
+                    showProgress(false)
+                    isLoggingIn = false
+                }
+            }
         }
     }
 
@@ -163,6 +183,62 @@ class LoginActivity : AppCompatActivity(), LoaderCallbacks<Cursor> {
     private fun isPasswordValid(password: String): Boolean {
         //TODO: Replace this with your own logic
         return password.length > 4
+    }
+
+    private fun loginToSendbird() {
+        val user = FirebaseAuth.getInstance().currentUser
+        user?.let {
+            val uid = user.uid
+
+            ConnectionManager.login(uid, SendBird.ConnectHandler { user, e ->
+                // Callback received; hide the progress bar.
+                showProgress(false)
+                isLoggingIn = false
+
+                if (e != null) {
+                    Log.e("LOGIN", "sendbird login error!")
+                    // Error!
+                    Toast.makeText(
+                        this@LoginActivity, "" + e.code + ": " + e.message,
+                        Toast.LENGTH_SHORT
+                    )
+                        .show()
+
+                    return@ConnectHandler
+                }
+
+                // Proceed to MainActivity
+                val intent = Intent(this@LoginActivity, MainActivity::class.java)
+                startActivity(intent)
+                finish()
+            })
+        }
+    }
+
+    private fun refreshToken() {
+        FirebaseInstanceId.getInstance().instanceId
+            .addOnSuccessListener(this@LoginActivity, object : OnSuccessListener<InstanceIdResult> {
+                override fun onSuccess(instanceIdResult: InstanceIdResult) {
+                    val newToken = instanceIdResult.token
+
+                    val mRootRef = FirebaseDatabase.getInstance().reference
+                    val user = FirebaseAuth.getInstance().currentUser
+
+                    val userReference = mRootRef.child("userInfo").child(user!!.uid).child("confidential/FCM")
+                    userReference.setValue(newToken, object : DatabaseReference.CompletionListener {
+                        override fun onComplete(databaseError: DatabaseError?, databaseReference: DatabaseReference) {
+                            if (databaseError != null) {
+                                Log.e(TAG, "Token Refresh Failed Status: " + databaseError.message)
+                            } else {
+                                Log.e(TAG, "Token Refresh Success")
+                            }
+
+                            //sign in to sendbird
+                            loginToSendbird()
+                        }
+                    })
+                }
+            })
     }
 
     /**
@@ -256,51 +332,6 @@ class LoginActivity : AppCompatActivity(), LoaderCallbacks<Cursor> {
         )
         val ADDRESS = 0
         val IS_PRIMARY = 1
-    }
-
-    /**
-     * Represents an asynchronous login/registration task used to authenticate
-     * the user.
-     */
-    inner class UserLoginTask internal constructor(private val mEmail: String, private val mPassword: String) :
-        AsyncTask<Void, Void, Boolean>() {
-
-        override fun doInBackground(vararg params: Void): Boolean? {
-            // TODO: attempt authentication against a network service.
-
-            try {
-                // Simulate network access.
-                Thread.sleep(2000)
-            } catch (e: InterruptedException) {
-                return false
-            }
-
-            return DUMMY_CREDENTIALS
-                .map { it.split(":") }
-                .firstOrNull { it[0] == mEmail }
-                ?.let {
-                    // Account exists, return true if the password matches.
-                    it[1] == mPassword
-                }
-                ?: true
-        }
-
-        override fun onPostExecute(success: Boolean?) {
-            mAuthTask = null
-            showProgress(false)
-
-            if (success!!) {
-                finish()
-            } else {
-                password.error = getString(R.string.error_incorrect_password)
-                password.requestFocus()
-            }
-        }
-
-        override fun onCancelled() {
-            mAuthTask = null
-            showProgress(false)
-        }
     }
 
     companion object {
